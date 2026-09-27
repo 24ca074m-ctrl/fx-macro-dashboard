@@ -806,7 +806,7 @@ elif analysis_mode == "📰 リアルタイム・マクロニュース＆市況"
     )
 
 # =========================================================
-# 6. バックグラウンドAI学習エンジン ＆ 勝率モニタリング統合
+# 6. バックグラウンドAI（全時間軸統合・テクニカルメーターモデル）
 # =========================================================
 import datetime
 import sqlite3
@@ -819,9 +819,7 @@ import yfinance as yf
 DB_PATH = "trades.db"
 
 
-# --- A. データベース初期化 (マルチスレッド対応) ---
 def get_db_connection():
-    # check_same_thread=False を指定してスレッド間衝突を防止
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 
@@ -839,7 +837,7 @@ def init_db():
         target_time TEXT,
         exit_price REAL,
         result TEXT,
-        vix_val REAL
+        score TEXT
     )
     """
     )
@@ -847,7 +845,6 @@ def init_db():
     conn.close()
 
 
-# --- ヘルパー: yfinanceのClose列を安全に1次元Seriesとして抽出 ---
 def safe_extract_close(df):
     if df.empty or "Close" not in df:
         return None
@@ -857,7 +854,38 @@ def safe_extract_close(df):
     return close_data.dropna()
 
 
-# --- B. 常時バックグラウンドで動くAI監視ロジック ---
+# 単一時間軸の売買スコアを計算（RSI + SMA乖離）
+def get_tf_score(close_s):
+    if len(close_s) < 20:
+        return 0  # データ不足
+
+    # RSI
+    delta = close_s.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    rsi = 100 - (100 / (1 + (gain / loss))).iloc[-1]
+
+    # MA20
+    ma20 = close_s.tail(20).mean()
+    last_c = close_s.iloc[-1]
+
+    score = 0
+    # 買い条件
+    if rsi < 40:
+        score += 1
+    if last_c > ma20:
+        score += 1
+
+    # 売り条件
+    if rsi > 60:
+        score -= 1
+    if last_c < ma20:
+        score -= 1
+
+    return score  # +2(強買い) ~ -2(強売り)
+
+
+# --- B. バックグラウンドで全時間軸（1分/5分/15分/1日）を解析 ---
 def ai_background_logger():
     init_db()
     while True:
@@ -868,7 +896,7 @@ def ai_background_logger():
             conn = get_db_connection()
             cursor = conn.cursor()
 
-            # ① 15分経過したシグナルの「答え合わせ」
+            # ① 判定待ち（1分前）のシグナルの答え合わせ
             cursor.execute(
                 "SELECT id, signal_type, entry_price FROM signals WHERE result"
                 " = 'PENDING' AND target_time <= ?",
@@ -877,13 +905,12 @@ def ai_background_logger():
             pending_list = cursor.fetchall()
 
             if pending_list:
-                df = yf.download(
+                df_curr = yf.download(
                     "JPY=X", period="1d", interval="1m", progress=False
                 )
-                close_s = safe_extract_close(df)
-                if close_s is not None and len(close_s) > 0:
-                    curr_p = float(close_s.iloc[-1])
-
+                close_curr = safe_extract_close(df_curr)
+                if close_curr is not None and len(close_curr) > 0:
+                    curr_p = float(close_curr.iloc[-1])
                     for row in pending_list:
                         sig_id, sig_type, entry_p = row
                         res = "LOSE"
@@ -897,61 +924,85 @@ def ai_background_logger():
                             (curr_p, res, sig_id),
                         )
 
-            # ② 新規シグナルの検出 (5分足MA乖離)
-            df_5m = yf.download(
-                "JPY=X", period="1d", interval="5m", progress=False
+            # ② 複数時間軸のデータを取得して総合判定
+            df_1m = yf.download(
+                "JPY=X", period="1d", interval="1m", progress=False
             )
-            close_5m = safe_extract_close(df_5m)
+            df_5m = yf.download(
+                "JPY=X", period="5d", interval="5m", progress=False
+            )
+            df_15m = yf.download(
+                "JPY=X", period="5d", interval="15m", progress=False
+            )
 
-            if close_5m is not None and len(close_5m) >= 20:
-                last_c = float(close_5m.iloc[-1])
-                ma20 = float(close_5m.tail(20).mean())
+            c_1m = safe_extract_close(df_1m)
+            c_5m = safe_extract_close(df_5m)
+            c_15m = safe_extract_close(df_15m)
 
+            if (
+                c_1m is not None
+                and c_5m is not None
+                and c_15m is not None
+                and len(c_1m) > 0
+            ):
+                # 各時間軸のスコア合算 (-6 ~ +6)
+                s_1m = get_tf_score(c_1m)
+                s_5m = get_tf_score(c_5m)
+                s_15m = get_tf_score(c_15m)
+                total_score = s_1m + s_5m + s_15m
+
+                last_p = float(c_1m.iloc[-1])
                 sig = None
-                if last_c > ma20 * 1.0003:
-                    sig = "BUY"
-                elif last_c < ma20 * 0.9997:
-                    sig = "SELL"
+
+                # 全時間軸の方向性が一致した（強いシグナル）場合のみエントリー
+                if total_score >= 4:
+                    sig = "BUY"  # 強い買い
+                elif total_score <= -4:
+                    sig = "SELL"  # 強い売り
 
                 if sig:
-                    # 直近10分以内に同じシグナルが出ていないか検証
-                    ten_mins_ago = (
-                        now - datetime.timedelta(minutes=10)
+                    # 連続シグナル発生の防止（1分間）
+                    one_min_ago = (
+                        now - datetime.timedelta(minutes=1)
                     ).strftime("%Y-%m-%d %H:%M:%S")
                     cursor.execute(
                         "SELECT id FROM signals WHERE signal_type = ? AND"
                         " timestamp >= ?",
-                        (sig, ten_mins_ago),
+                        (sig, one_min_ago),
                     )
+
                     if not cursor.fetchone():
                         target_dt = (
-                            now + datetime.timedelta(minutes=15)
+                            now + datetime.timedelta(minutes=1)
                         ).strftime("%Y-%m-%d %H:%M:%S")
                         cursor.execute(
                             "INSERT INTO signals (timestamp, symbol,"
                             " signal_type, entry_price, target_time, result,"
-                            " vix_val) VALUES (?, ?, ?, ?, ?, 'PENDING', 0)",
-                            (now_str, "USD/JPY", sig, last_c, target_dt),
+                            " score) VALUES (?, ?, ?, ?, ?, 'PENDING', ?)",
+                            (
+                                now_str,
+                                "USD/JPY",
+                                sig,
+                                last_p,
+                                target_dt,
+                                f"Score:{total_score}",
+                            ),
                         )
 
             conn.commit()
             conn.close()
-        except Exception as e:
-            # デバッグ用にエラーを出力したい場合はprint(e)
+        except Exception:
             pass
 
-        time.sleep(300)  # 5分ごとに巡回
+        time.sleep(60)  # 1分ごとに全時間軸を判定
 
 
-# アプリ起動時にバックグラウンドスレッドを起動（二重起動防止ロジック付き）
 @st.cache_resource
 def start_ai_thread():
     init_db()
-    # 既存のバックグラウンドスレッドがあるか確認
     for thread in threading.enumerate():
         if thread.name == "AI_Logger_Thread":
             return True
-
     t = threading.Thread(
         target=ai_background_logger, name="AI_Logger_Thread", daemon=True
     )
@@ -962,9 +1013,9 @@ def start_ai_thread():
 start_ai_thread()
 
 
-# --- C. Streamlit画面にAIの勝率を表示 ---
+# --- C. UI表示 ---
 st.markdown("---")
-st.subheader("🤖 AI自己学習シグナル＆勝率モニタリング")
+st.subheader("🎯 マルチタイムフレーム（1分/5分/15分）全自動AI判定モニタリング")
 
 
 def load_perf():
@@ -988,20 +1039,27 @@ if not df_perf.empty:
     rate = (wins / total * 100) if total > 0 else 0.0
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("AI検証済み総数", f"{total} 回")
-    c2.metric("AI現在の勝率", f"{rate:.1f} %")
+    c1.metric("総合AI検証数", f"{total} 回")
+    c2.metric("全時間軸一致時の勝率", f"{rate:.1f} %")
     c3.metric("勝ち数", f"{wins} 勝")
-    c4.metric("15分後判定待ち", f"{len(pending)} 件")
+    c4.metric("判定待ち", f"{len(pending)} 件")
 
-    st.markdown("##### 📜 直近のAIシグナルと15分後の答え合わせ履歴")
+    st.markdown("##### 📜 1分ごとの全時間軸判定ログ")
     st.dataframe(
-        df_perf.sort_values(by="id", ascending=False).head(10)[
-            ["timestamp", "signal_type", "entry_price", "exit_price", "result"]
+        df_perf.sort_values(by="id", ascending=False).head(15)[
+            [
+                "timestamp",
+                "signal_type",
+                "score",
+                "entry_price",
+                "exit_price",
+                "result",
+            ]
         ],
         use_container_width=True,
     )
 else:
     st.info(
         "💡"
-        " バックグラウンドでAIが初回データの収集を開始しました。しばらくお待ちください。"
+        " 1分ごとに「1分足・5分足・15分足」を合算分析しています。条件が揃うまでしばらくお待ちください。"
     )
